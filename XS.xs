@@ -1,3 +1,4 @@
+#define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
@@ -129,7 +130,30 @@ enum {
 
 #define INCR_DONE(json) ((json)->incr_nest <= 0 && (json)->incr_mode == INCR_M_JSON)
 
+/* JE = JSON Encode
+   JD = JSON Decode
+   2nd part of macro matches Perl API
+*/
+#ifdef PERL_IMPLICIT_CONTEXT
+#define JEaTHX enc->json.my_perl
+#define JEaTHX_ JEaTHX,
+#define JEdTHX dTHXa(enc->json.my_perl)
+#define JDaTHX dec->json.my_perl
+#define JDaTHX_ JDaTHX,
+#define JDdTHX dTHXa(dec->json.my_perl)
+#else
+#define JEaTHX
+#define JEaTHX_
+#define JEdTHX dNOOP
+#define JDaTHX
+#define JDaTHX_
+#define JDdTHX dNOOP
+#endif
+
 typedef struct {
+#ifdef PERL_IMPLICIT_CONTEXT
+  tTHX my_perl;
+#endif
   U32 flags;
   U32 max_depth;
   STRLEN max_size;
@@ -155,7 +179,7 @@ json_init (JSON *json)
 /* utility functions */
 
 INLINE SV *
-get_bool (const char *name)
+get_bool (pTHX_ const char *name)
 {
   SV *sv = get_sv (name, 1);
 
@@ -166,7 +190,7 @@ get_bool (const char *name)
 }
 
 INLINE void
-shrink (SV *sv)
+shrink (pTHX_ SV *sv)
 {
   sv_utf8_downgrade (sv, 1);
 
@@ -186,7 +210,7 @@ shrink (SV *sv)
 /* but use the very good perl function to parse anything else. */
 /* note that we never call this function for a ascii codepoints */
 INLINE UV
-decode_utf8 (unsigned char *s, STRLEN len, STRLEN *clen)
+decode_utf8 (pTHX_ unsigned char *s, STRLEN len, STRLEN *clen)
 {
   if (expect_true (len >= 2
                    && IN_RANGE_INC (char, s[0], 0xc2, 0xdf)
@@ -231,7 +255,7 @@ encode_utf8 (unsigned char *s, UV ch)
 
 /* convert offset pointer to character index, sv must be string */
 static STRLEN
-ptr_to_index (SV *sv, const U8 *offset)
+ptr_to_index (pTHX_ SV *sv, const U8 *offset)
 {
   return SvUTF8 (sv)
          ? utf8_distance ((U8*)offset, (U8*)SvPVX (sv))
@@ -384,6 +408,7 @@ need (enc_t *enc, STRLEN len)
   if (expect_false (enc->cur + len >= enc->end))
     {
       STRLEN cur = enc->cur - (char *)SvPVX (enc->sv);
+      JEdTHX;
       SvGROW (enc->sv, cur + (len < (cur >> 2) ? cur >> 2 : len) + 1);
       enc->cur = SvPVX (enc->sv) + cur;
       enc->end = SvPVX (enc->sv) + SvLEN (enc->sv) - 1;
@@ -454,7 +479,7 @@ encode_str (enc_t *enc, char *str, STRLEN len, int is_utf8)
 
                   if (is_utf8 && !(enc->json.flags & F_BINARY))
                     {
-                      uch = decode_utf8 ((unsigned char *)str, end - str, &clen);
+                      uch = decode_utf8 (JEaTHX_ (unsigned char *)str, end - str, &clen);
                       if (clen == (STRLEN)-1)
                         croak ("malformed or illegal unicode character in string [%.11s], cannot convert to JSON", str);
                     }
@@ -578,6 +603,7 @@ static void encode_sv (enc_t *enc, SV *sv);
 static void
 encode_av (enc_t *enc, AV *av)
 {
+  JEdTHX;
   int i, len = av_len (av);
 
   if (enc->indent >= enc->json.max_depth)
@@ -620,6 +646,7 @@ encode_hk (enc_t *enc, HE *he)
       SV *sv = HeSVKEY (he);
       STRLEN len;
       char *str;
+      JEdTHX;
       
       SvGETMAGIC (sv);
       str = SvPV (sv, len);
@@ -640,6 +667,7 @@ encode_hk (enc_t *enc, HE *he)
 static int
 he_cmp_fast (const void *a_, const void *b_)
 {
+  dTHX;
   int cmp;
 
   HE *a = *(HE **)a_;
@@ -658,6 +686,7 @@ he_cmp_fast (const void *a_, const void *b_)
 static int
 he_cmp_slow (const void *a, const void *b)
 {
+  dTHX;
   return sv_cmp (HeSVKEY_force (*(HE **)b), HeSVKEY_force (*(HE **)a));
 }
 
@@ -665,12 +694,14 @@ static void
 encode_hv (enc_t *enc, HV *hv)
 {
   HE *he;
+  dTHXa(NULL);
 
   if (enc->indent >= enc->json.max_depth)
     croak (ERR_NESTING_EXCEEDED);
 
   encode_ch (enc, '{');
 
+  aTHXa(JEaTHX);
   /* for canonical output we have to sort by keys first */
   /* actually, this is mostly due to the stupid so-called */
   /* security workaround added somewhere in 5.8.x */
@@ -779,6 +810,7 @@ static void
 encode_rv (enc_t *enc, SV *sv)
 {
   svtype svt;
+  JEdTHX;
 
   SvGETMAGIC (sv);
   svt = SvTYPE (sv);
@@ -812,7 +844,9 @@ encode_rv (enc_t *enc, SV *sv)
                 {
                   dSP;
                   SV *rv;
+#if PERL_VERSION < 10
                   HV *stash;
+#endif
 
                   ENTER; SAVETMPS; PUSHMARK (SP);
 
@@ -884,6 +918,7 @@ encode_rv (enc_t *enc, SV *sv)
 static void
 encode_sv (enc_t *enc, SV *sv)
 {
+  JEdTHX;
   SvGETMAGIC (sv);
 
   if (SvPOKp (sv))
@@ -963,7 +998,10 @@ encode_json (SV *scalar, JSON *json)
     croak ("hash- or arrayref expected (not a simple scalar, use allow_nonref to allow this)");
 
   enc.json      = *json;
-  enc.sv        = sv_2mortal (NEWSV (0, INIT_SIZE));
+  {
+    dTHXa(enc.json.my_perl);
+    enc.sv        = sv_2mortal (NEWSV (0, INIT_SIZE));
+  }
   enc.cur       = SvPVX (enc.sv);
   enc.end       = SvEND (enc.sv);
   enc.indent    = 0;
@@ -983,7 +1021,11 @@ encode_json (SV *scalar, JSON *json)
     SvUTF8_on (enc.sv);
 
   if (enc.json.flags & F_SHRINK)
+#ifdef PERL_IMPLICIT_CONTEXT
+    shrink (enc.json.my_perl, enc.sv);
+#else
     shrink (enc.sv);
+#endif
 
   return enc.sv;
 }
@@ -1107,6 +1149,7 @@ fail:
 static SV *
 decode_str (dec_t *dec)
 {
+  JDdTHX;
   SV *sv = 0;
   int utf8 = 0;
   char *dec_cur = dec->cur;
@@ -1229,7 +1272,7 @@ decode_str (dec_t *dec)
 
               --dec_cur;
 
-              decode_utf8 ((U8*)dec_cur, dec->end - dec_cur, &clen);
+              decode_utf8 (aTHX_ (U8*)dec_cur, dec->end - dec_cur, &clen);
               if (clen == (STRLEN)-1)
                 ERR ("malformed UTF-8 character in JSON string");
 
@@ -1294,6 +1337,7 @@ fail:
 static SV *
 decode_num (dec_t *dec)
 {
+  dTHXa(NULL);
   int is_nv = 0;
   char *start = dec->cur;
 
@@ -1353,6 +1397,7 @@ decode_num (dec_t *dec)
       is_nv = 1;
     }
 
+  aTHXa(dec->json.my_perl);
   if (!is_nv)
     {
       int len = dec->cur - start;
@@ -1416,6 +1461,7 @@ fail:
 static SV *
 decode_av (dec_t *dec)
 {
+  JDdTHX;
   AV *av = newAV ();
 
   DEC_INC_DEPTH;
@@ -1468,6 +1514,7 @@ fail:
 static SV *
 decode_hv (dec_t *dec)
 {
+  JDdTHX;
   SV *sv;
   HV *hv = newHV ();
 
@@ -1635,6 +1682,7 @@ fail:
 static SV *
 decode_sv (dec_t *dec)
 {
+  JDdTHX;
   /* the beauty of JSON: you need exactly one character lookahead */
   /* to parse everything. */
   switch (*dec->cur)
@@ -1653,7 +1701,7 @@ decode_sv (dec_t *dec)
           {
             dec->cur += 4;
 #if JSON_SLOW
-            json_true = get_bool ("Cpanel::JSON::XS::true");
+            json_true = get_bool (aTHX_ "Cpanel::JSON::XS::true");
 #endif
             return newSVsv (json_true);
           }
@@ -1667,7 +1715,7 @@ decode_sv (dec_t *dec)
           {
             dec->cur += 5;
 #if JSON_SLOW
-            json_false = get_bool ("Cpanel::JSON::XS::false");
+            json_false = get_bool (aTHX_ "Cpanel::JSON::XS::false");
 #endif
             return newSVsv (json_false);
           }
@@ -1701,6 +1749,7 @@ decode_json (SV *string, JSON *json, U8 **offset_return)
 {
   dec_t dec;
   SV *sv;
+  dTHXa(json->my_perl);
 
   /* work around bugs in 5.10 where manipulating magic values
    * will perl ignore the magic in subsequent accesses.
@@ -1790,7 +1839,7 @@ decode_json (SV *string, JSON *json, U8 **offset_return)
 #endif
       croak ("%s, at character offset %d (before \"%s\")",
              dec.err,
-             (int)ptr_to_index (string, (U8*)dec.cur),
+             (int)ptr_to_index (aTHX_ string, (U8*)dec.cur),
              dec.cur != dec.end ? SvPV_nolen (uni) : "(end of string)");
     }
 
@@ -1974,8 +2023,8 @@ BOOT:
 	json_stash         = gv_stashpv ("Cpanel::JSON::XS"         , 1);
 	json_boolean_stash = gv_stashpv ("JSON::XS::Boolean", 1);
 
-        json_true  = get_bool ("Cpanel::JSON::XS::true");
-        json_false = get_bool ("Cpanel::JSON::XS::false");
+        json_true  = get_bool (aTHX_ "Cpanel::JSON::XS::true");
+        json_false = get_bool (aTHX_ "Cpanel::JSON::XS::false");
 
         CvNODEBUG_on (get_cv ("Cpanel::JSON::XS::incr_text", 0)); /* the debugger completely breaks lvalue subs */
 }
@@ -1993,6 +2042,9 @@ void new (char *klass)
   	SV *pv = NEWSV (0, sizeof (JSON));
         SvPOK_only (pv);
         json_init ((JSON *)SvPVX (pv));
+#ifdef PERL_IMPLICIT_CONTEXT
+        ((JSON *)SvPVX(pv))->my_perl = aTHX;
+#endif
         XPUSHs (sv_2mortal (sv_bless (
            newRV_noinc (pv),
            strEQ (klass, "Cpanel::JSON::XS") ? JSON_STASH : gv_stashpv (klass, 1)
@@ -2116,7 +2168,7 @@ void decode_prefix (JSON *self, SV *jsonstr)
         PUTBACK; sv = decode_json (jsonstr, self, &offset); SPAGAIN;
         EXTEND (SP, 2);
         PUSHs (sv);
-        PUSHs (sv_2mortal (newSVuv (ptr_to_index (jsonstr, offset))));
+        PUSHs (sv_2mortal (newSVuv (ptr_to_index (aTHX_ jsonstr, offset))));
 }
 
 void incr_parse (JSON *self, SV *jsonstr = 0)
@@ -2281,6 +2333,9 @@ void encode_json (SV *scalar)
         JSON json;
         json_init (&json);
         json.flags |= ix;
+#ifdef PERL_IMPLICIT_CONTEXT
+        json.my_perl = aTHX;
+#endif
         PUTBACK; scalar = encode_json (scalar, &json); SPAGAIN;
         XPUSHs (scalar);
 }
@@ -2294,6 +2349,9 @@ void decode_json (SV *jsonstr)
         JSON json;
         json_init (&json);
         json.flags |= ix;
+#ifdef PERL_IMPLICIT_CONTEXT
+        json.my_perl = aTHX;
+#endif
         PUTBACK; jsonstr = decode_json (jsonstr, &json, 0); SPAGAIN;
         XPUSHs (jsonstr);
 }
